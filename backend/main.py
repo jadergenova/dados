@@ -1,18 +1,13 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, UploadFile, File, Request
+from fastapi.responses import JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 import pandas as pd
 import io
 from collections import Counter
 from typing import Optional
+import os
 
 app = FastAPI(title="Supermarket Analytics API")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Em produção, substitua pelo domínio do seu frontend
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 COLS = ['NR_CPF', 'DT_MOVTO', 'TOTAL_CUPOM', 'CD_PROD', 'DS_PROD', 'TOTAL_ITEM', 'SETOR']
 
@@ -46,25 +41,20 @@ def analyze(df: pd.DataFrame, city: str) -> dict:
     cliente_valor = df.groupby('NR_CPF')['TOTAL_ITEM'].sum().sort_values(ascending=False)
     top20_pct = float(cliente_valor.head(int(len(cliente_valor) * 0.2)).sum() / receita * 100)
 
-    # Setores
     setores = (
         df.groupby('SETOR')['TOTAL_ITEM'].sum()
         .sort_values(ascending=False)
         .head(12)
     )
-
-    # Produtos
     produtos = (
         df.groupby('DS_PROD')['TOTAL_ITEM'].sum()
         .sort_values(ascending=False)
         .head(20)
     )
 
-    # Semanal
     df['SEMANA'] = df['DT_MOVTO'].dt.to_period('W').astype(str)
     semanal = df.groupby('SEMANA')['TOTAL_ITEM'].sum().to_dict()
 
-    # Dias da semana
     day_map = {
         'Monday': 'Seg', 'Tuesday': 'Ter', 'Wednesday': 'Qua',
         'Thursday': 'Qui', 'Friday': 'Sex', 'Saturday': 'Sáb', 'Sunday': 'Dom'
@@ -72,7 +62,6 @@ def analyze(df: pd.DataFrame, city: str) -> dict:
     df['DIA'] = df['DT_MOVTO'].dt.day_name().map(day_map)
     dias = df.groupby('DIA')['NR_CPF'].count().to_dict()
 
-    # Pares de setores
     cupom_setores = df.groupby(['NR_CPF', 'DT_MOVTO'])['SETOR'].apply(list)
     pares = Counter()
     for setores_list in cupom_setores:
@@ -105,18 +94,9 @@ def analyze(df: pd.DataFrame, city: str) -> dict:
             "ocasional": ocasional,
             "ocasional_pct": round(ocasional / total_cli * 100, 1),
         },
-        "setores": [
-            {"setor": k, "receita": float(v)}
-            for k, v in setores.items()
-        ],
-        "produtos_top20": [
-            {"produto": k, "receita": float(v)}
-            for k, v in produtos.items()
-        ],
-        "semanal": [
-            {"semana": k, "receita": float(v)}
-            for k, v in sorted(semanal.items())
-        ],
+        "setores": [{"setor": k, "receita": float(v)} for k, v in setores.items()],
+        "produtos_top20": [{"produto": k, "receita": float(v)} for k, v in produtos.items()],
+        "semanal": [{"semana": k, "receita": float(v)} for k, v in sorted(semanal.items())],
         "dias": dias,
         "pares_setores": [
             {"par": f"{p[0]} + {p[1]}", "cupons": cnt}
@@ -125,42 +105,34 @@ def analyze(df: pd.DataFrame, city: str) -> dict:
     }
 
 
-# --- Endpoints ---
+# --- API Endpoints ---
 
-@app.get("/")
-def root():
-    return {"status": "ok", "message": "Supermarket Analytics API"}
+@app.get("/ping")
+def ping():
+    return {"pong": True}
 
 
 @app.post("/analyze/single")
-async def analyze_single(
-    file: UploadFile = File(...),
-    city: str = "Loja"
-):
-    """Analisa uma única loja."""
+async def analyze_single(file: UploadFile = File(...), city: str = "Loja"):
     content = await file.read()
     try:
         df = load_df(content)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Erro ao ler arquivo: {str(e)}")
+        return JSONResponse(status_code=400, content={"detail": str(e)})
     return analyze(df, city)
 
 
 @app.post("/analyze/compare")
 async def analyze_compare(
-    file1: UploadFile = File(...),
-    city1: str = "Loja 1",
-    file2: UploadFile = File(...),
-    city2: str = "Loja 2",
-    file3: Optional[UploadFile] = File(None),
-    city3: Optional[str] = "Loja 3",
+    file1: UploadFile = File(...), city1: str = "Loja 1",
+    file2: UploadFile = File(...), city2: str = "Loja 2",
+    file3: Optional[UploadFile] = File(None), city3: Optional[str] = "Loja 3",
 ):
-    """Analisa e compara até 3 lojas, incluindo produtos em comum."""
-    results = []
     files = [(file1, city1), (file2, city2)]
     if file3:
         files.append((file3, city3))
 
+    results = []
     dfs = []
     for f, city in files:
         content = await f.read()
@@ -169,26 +141,22 @@ async def analyze_compare(
             dfs.append((df, city))
             results.append(analyze(df, city))
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Erro em {city}: {str(e)}")
+            return JSONResponse(status_code=400, content={"detail": f"Erro em {city}: {str(e)}"})
 
-    # Produtos em comum (top 20 de cada)
     tops = []
     for df, city in dfs:
         top = df.groupby('DS_PROD')['TOTAL_ITEM'].sum().sort_values(ascending=False).head(20)
         tops.append((city, set(top.index), top))
 
-    # Sobreposição de base (CPFs)
     cpf_sets = {city: set(df['NR_CPF'].unique()) for df, city in dfs}
     overlap = {}
     cities = list(cpf_sets.keys())
     for i in range(len(cities)):
         for j in range(i + 1, len(cities)):
-            key = f"{cities[i]} ∩ {cities[j]}"
-            overlap[key] = len(cpf_sets[cities[i]] & cpf_sets[cities[j]])
+            overlap[f"{cities[i]} ∩ {cities[j]}"] = len(cpf_sets[cities[i]] & cpf_sets[cities[j]])
     if len(cities) == 3:
         overlap["Todas"] = len(cpf_sets[cities[0]] & cpf_sets[cities[1]] & cpf_sets[cities[2]])
 
-    # Produtos universais (em todas as lojas)
     universal_set = tops[0][1]
     for _, s, _ in tops[1:]:
         universal_set = universal_set & s
@@ -202,7 +170,6 @@ async def analyze_compare(
         universal.append(entry)
     universal.sort(key=lambda x: min(v["rank"] for v in x["lojas"].values()))
 
-    # Exclusivos por loja
     exclusivos = {}
     for city, s, top in tops:
         others = set()
@@ -224,3 +191,13 @@ async def analyze_compare(
             "exclusivos_por_loja": exclusivos,
         }
     }
+
+
+# --- Serve frontend estático (deve ficar por último) ---
+STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+if os.path.exists(STATIC_DIR):
+    app.mount("/assets", StaticFiles(directory=os.path.join(STATIC_DIR, "assets")), name="assets")
+
+    @app.get("/{full_path:path}")
+    async def serve_frontend(full_path: str):
+        return FileResponse(os.path.join(STATIC_DIR, "index.html"))
