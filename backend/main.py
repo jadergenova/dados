@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, Request
+from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 import pandas as pd
@@ -6,6 +6,7 @@ import io
 from collections import Counter
 from typing import Optional
 import os
+import gc
 
 app = FastAPI(title="Supermarket Analytics API")
 
@@ -16,20 +17,31 @@ def load_df(file_bytes: bytes) -> pd.DataFrame:
     df = pd.read_csv(
         io.BytesIO(file_bytes),
         sep=';', encoding='latin1',
-        low_memory=False, decimal=',', quotechar='"'
+        low_memory=False, decimal=',', quotechar='"',
+        # Carregar apenas colunas necessárias e tipos otimizados
+        dtype={
+            'NR_CPF': 'int64',
+            'TOTAL_CUPOM': 'str',
+            'CD_PROD': 'str',
+            'DS_PROD': 'str',
+            'TOTAL_ITEM': 'str',
+            'SETOR': 'str',
+        }
     )
     df.columns = COLS
     df['DT_MOVTO'] = pd.to_datetime(df['DT_MOVTO'], format='%d/%m/%y', errors='coerce')
-    df['TOTAL_ITEM'] = pd.to_numeric(df['TOTAL_ITEM'], errors='coerce')
-    df['TOTAL_CUPOM'] = pd.to_numeric(df['TOTAL_CUPOM'], errors='coerce')
-    df['SETOR'] = df['SETOR'].fillna('').astype(str)
+    df['TOTAL_ITEM'] = pd.to_numeric(df['TOTAL_ITEM'].str.replace(',', '.'), errors='coerce')
+    df['TOTAL_CUPOM'] = pd.to_numeric(df['TOTAL_CUPOM'].str.replace(',', '.'), errors='coerce')
+    df['SETOR'] = df['SETOR'].fillna('').astype('category')
+    df['DS_PROD'] = df['DS_PROD'].astype('category')
     df = df[df['NR_CPF'] > 0]
+    gc.collect()
     return df
 
 
 def analyze(df: pd.DataFrame, city: str) -> dict:
     visitas = df.groupby('NR_CPF')['DT_MOVTO'].nunique()
-    cupons_unicos = df.groupby(['NR_CPF', 'DT_MOVTO']).ngroups
+    cupons_unicos = int(df.groupby(['NR_CPF', 'DT_MOVTO']).ngroups)
     receita = float(df['TOTAL_ITEM'].sum())
     ticket = df.groupby(['NR_CPF', 'DT_MOVTO'])['TOTAL_CUPOM'].first()
     total_cli = len(visitas)
@@ -41,41 +53,32 @@ def analyze(df: pd.DataFrame, city: str) -> dict:
     cliente_valor = df.groupby('NR_CPF')['TOTAL_ITEM'].sum().sort_values(ascending=False)
     top20_pct = float(cliente_valor.head(int(len(cliente_valor) * 0.2)).sum() / receita * 100)
 
-    setores = (
-        df.groupby('SETOR')['TOTAL_ITEM'].sum()
-        .sort_values(ascending=False)
-        .head(12)
-    )
-    produtos = (
-        df.groupby('DS_PROD')['TOTAL_ITEM'].sum()
-        .sort_values(ascending=False)
-        .head(20)
-    )
+    setores = df.groupby('SETOR')['TOTAL_ITEM'].sum().sort_values(ascending=False).head(12)
+    produtos = df.groupby('DS_PROD')['TOTAL_ITEM'].sum().sort_values(ascending=False).head(20)
 
     df['SEMANA'] = df['DT_MOVTO'].dt.to_period('W').astype(str)
     semanal = df.groupby('SEMANA')['TOTAL_ITEM'].sum().to_dict()
 
-    day_map = {
-        'Monday': 'Seg', 'Tuesday': 'Ter', 'Wednesday': 'Qua',
-        'Thursday': 'Qui', 'Friday': 'Sex', 'Saturday': 'Sáb', 'Sunday': 'Dom'
-    }
+    day_map = {'Monday':'Seg','Tuesday':'Ter','Wednesday':'Qua','Thursday':'Qui',
+               'Friday':'Sex','Saturday':'Sáb','Sunday':'Dom'}
     df['DIA'] = df['DT_MOVTO'].dt.day_name().map(day_map)
     dias = df.groupby('DIA')['NR_CPF'].count().to_dict()
 
-    cupom_setores = df.groupby(['NR_CPF', 'DT_MOVTO'])['SETOR'].apply(list)
+    # Pares de setores — amostra para economizar memória
+    sample = df.drop_duplicates(['NR_CPF','DT_MOVTO','SETOR'])
+    cupom_setores = sample.groupby(['NR_CPF','DT_MOVTO'])['SETOR'].apply(list)
     pares = Counter()
-    for setores_list in cupom_setores:
-        s = sorted(set([x for x in setores_list if x and x != 'nan']))
+    for sl in cupom_setores:
+        s = sorted(set([str(x) for x in sl if x and str(x) != 'nan']))
         for i in range(len(s)):
-            for j in range(i + 1, len(s)):
+            for j in range(i+1, len(s)):
                 pares[(s[i], s[j])] += 1
+
+    gc.collect()
 
     return {
         "city": city,
-        "periodo": {
-            "inicio": str(df['DT_MOVTO'].min().date()),
-            "fim": str(df['DT_MOVTO'].max().date()),
-        },
+        "periodo": {"inicio": str(df['DT_MOVTO'].min().date()), "fim": str(df['DT_MOVTO'].max().date())},
         "kpis": {
             "receita_total": receita,
             "cupons_unicos": cupons_unicos,
@@ -87,21 +90,15 @@ def analyze(df: pd.DataFrame, city: str) -> dict:
             "top20_pct_receita": top20_pct,
         },
         "recorrencia": {
-            "fiel": fiel,
-            "fiel_pct": round(fiel / total_cli * 100, 1),
-            "regular": regular,
-            "regular_pct": round(regular / total_cli * 100, 1),
-            "ocasional": ocasional,
-            "ocasional_pct": round(ocasional / total_cli * 100, 1),
+            "fiel": fiel, "fiel_pct": round(fiel/total_cli*100, 1),
+            "regular": regular, "regular_pct": round(regular/total_cli*100, 1),
+            "ocasional": ocasional, "ocasional_pct": round(ocasional/total_cli*100, 1),
         },
-        "setores": [{"setor": k, "receita": float(v)} for k, v in setores.items()],
-        "produtos_top20": [{"produto": k, "receita": float(v)} for k, v in produtos.items()],
-        "semanal": [{"semana": k, "receita": float(v)} for k, v in sorted(semanal.items())],
-        "dias": dias,
-        "pares_setores": [
-            {"par": f"{p[0]} + {p[1]}", "cupons": cnt}
-            for p, cnt in pares.most_common(12)
-        ],
+        "setores": [{"setor": k, "receita": float(v)} for k,v in setores.items()],
+        "produtos_top20": [{"produto": k, "receita": float(v)} for k,v in produtos.items()],
+        "semanal": [{"semana": k, "receita": float(v)} for k,v in sorted(semanal.items())],
+        "dias": {k: int(v) for k,v in dias.items()},
+        "pares_setores": [{"par": f"{p[0]} + {p[1]}", "cupons": cnt} for p,cnt in pares.most_common(12)],
     }
 
 
@@ -117,9 +114,14 @@ async def analyze_single(file: UploadFile = File(...), city: str = "Loja"):
     content = await file.read()
     try:
         df = load_df(content)
+        del content
+        gc.collect()
     except Exception as e:
         return JSONResponse(status_code=400, content={"detail": str(e)})
-    return analyze(df, city)
+    result = analyze(df, city)
+    del df
+    gc.collect()
+    return result
 
 
 @app.post("/analyze/compare")
@@ -128,9 +130,9 @@ async def analyze_compare(
     file2: UploadFile = File(...), city2: str = "Loja 2",
     file3: Optional[UploadFile] = File(None), city3: Optional[str] = "Loja 3",
 ):
-    files = [(file1, city1), (file2, city2)]
+    files = [(file1,city1),(file2,city2)]
     if file3:
-        files.append((file3, city3))
+        files.append((file3,city3))
 
     results = []
     dfs = []
@@ -138,8 +140,11 @@ async def analyze_compare(
         content = await f.read()
         try:
             df = load_df(content)
+            del content
+            gc.collect()
             dfs.append((df, city))
             results.append(analyze(df, city))
+            gc.collect()
         except Exception as e:
             return JSONResponse(status_code=400, content={"detail": f"Erro em {city}: {str(e)}"})
 
@@ -149,10 +154,13 @@ async def analyze_compare(
         tops.append((city, set(top.index), top))
 
     cpf_sets = {city: set(df['NR_CPF'].unique()) for df, city in dfs}
+    del dfs
+    gc.collect()
+
     overlap = {}
     cities = list(cpf_sets.keys())
     for i in range(len(cities)):
-        for j in range(i + 1, len(cities)):
+        for j in range(i+1, len(cities)):
             overlap[f"{cities[i]} ∩ {cities[j]}"] = len(cpf_sets[cities[i]] & cpf_sets[cities[j]])
     if len(cities) == 3:
         overlap["Todas"] = len(cpf_sets[cities[0]] & cpf_sets[cities[1]] & cpf_sets[cities[2]])
@@ -177,23 +185,16 @@ async def analyze_compare(
             if c2 != city:
                 others |= s2
         excl_set = s - others
-        exclusivos[city] = [
-            {"produto": p, "rank": list(top.index).index(p) + 1, "receita": float(top[p])}
-            for p in excl_set
-        ]
+        exclusivos[city] = [{"produto": p, "rank": list(top.index).index(p)+1, "receita": float(top[p])} for p in excl_set]
         exclusivos[city].sort(key=lambda x: x["rank"])
 
     return {
         "lojas": results,
-        "comparativo": {
-            "overlap_cpf": overlap,
-            "produtos_universais": universal,
-            "exclusivos_por_loja": exclusivos,
-        }
+        "comparativo": {"overlap_cpf": overlap, "produtos_universais": universal, "exclusivos_por_loja": exclusivos}
     }
 
 
-# --- Serve frontend estático (deve ficar por último) ---
+# --- Serve frontend estático ---
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 if os.path.exists(STATIC_DIR):
     app.mount("/assets", StaticFiles(directory=os.path.join(STATIC_DIR, "assets")), name="assets")
